@@ -23,12 +23,14 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
 FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.  */
 
+#include <config.h>
+
 #include <assert.h>
 #include <ctype.h>
 #include <string.h>
+#include "htslib/hts.h"
 #include "htslib/sam.h"
 #include "bam2bcf.h"
-#include "kprobaln.h"
 #include "htslib/khash.h"
 KHASH_SET_INIT_STR(rg)
 
@@ -197,7 +199,7 @@ int bcf_call_gap_prep(int n, int *n_plp, bam_pileup1_t **plp, int pos, bcf_calla
                 j = bam_cigar2qlen(p->b->core.n_cigar, bam_get_cigar(p->b));
                 if (j > max_rd_len) max_rd_len = j;
             }
-            float frac = (float)na/nt;
+            double frac = (double)na/nt;
             if ( !indel_support_ok && na >= bca->min_support && frac >= bca->min_frac )
                 indel_support_ok = 1;
             if ( na > bca->max_support && frac > 0 ) bca->max_support = na, bca->max_frac = frac;
@@ -215,7 +217,7 @@ int bcf_call_gap_prep(int n, int *n_plp, bam_pileup1_t **plp, int pos, bcf_calla
             if (aux[i] != aux[i-1]) ++n_types;
         // Taking totals makes it hard to call rare indels
         if ( !bca->per_sample_flt )
-            indel_support_ok = ( (float)n_alt / n_tot < bca->min_frac || n_alt < bca->min_support ) ? 0 : 1;
+            indel_support_ok = ( (double)n_alt / n_tot < bca->min_frac || n_alt < bca->min_support ) ? 0 : 1;
         if ( n_types == 1 || !indel_support_ok ) { // then skip
             free(aux); return -1;
         }
@@ -357,7 +359,7 @@ int bcf_call_gap_prep(int n, int *n_plp, bam_pileup1_t **plp, int pos, bcf_calla
     bca->indelreg = 0;
     for (t = 0; t < n_types; ++t) {
         int l, ir;
-        kpa_par_t apf1 = { 1e-4, 1e-2, 10 }, apf2 = { 1e-6, 1e-3, 10 };
+        probaln_par_t apf1 = { 1e-4, 1e-2, 10 }, apf2 = { 1e-6, 1e-3, 10 };
         apf1.bw = apf2.bw = abs(types[t]) + 3;
         // compute indelreg
         if (types[t] == 0) ir = 0;
@@ -410,14 +412,14 @@ int bcf_call_gap_prep(int n, int *n_plp, bam_pileup1_t **plp, int pos, bcf_calla
                         if (qq[l - qbeg] > 30) qq[l - qbeg] = 30;
                         if (qq[l - qbeg] < 7) qq[l - qbeg] = 7;
                     }
-                    sc = kpa_glocal((uint8_t*)ref2 + tbeg - left, tend - tbeg + abs(types[t]),
-                                    (uint8_t*)query, qend - qbeg, qq, &apf1, 0, 0);
+                    sc = probaln_glocal((uint8_t*)ref2 + tbeg - left, tend - tbeg + abs(types[t]),
+                                        (uint8_t*)query, qend - qbeg, qq, &apf1, 0, 0);
                     l = (int)(100. * sc / (qend - qbeg) + .499); // used for adjusting indelQ below
                     if (l > 255) l = 255;
                     score1[K*n_types + t] = score2[K*n_types + t] = sc<<8 | l;
                     if (sc > 5) {
-                        sc = kpa_glocal((uint8_t*)ref2 + tbeg - left, tend - tbeg + abs(types[t]),
-                                        (uint8_t*)query, qend - qbeg, qq, &apf2, 0, 0);
+                        sc = probaln_glocal((uint8_t*)ref2 + tbeg - left, tend - tbeg + abs(types[t]),
+                                            (uint8_t*)query, qend - qbeg, qq, &apf2, 0, 0);
                         l = (int)(100. * sc / (qend - qbeg) + .499);
                         if (l > 255) l = 255;
                         score2[K*n_types + t] = sc<<8 | l;

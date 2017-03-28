@@ -1,6 +1,6 @@
 /*  bam_mate.c -- fix mate pairing information and clean up flags.
 
-    Copyright (C) 2009, 2011-2014 Genome Research Ltd.
+    Copyright (C) 2009, 2011-2017 Genome Research Ltd.
     Portions copyright (C) 2011 Broad Institute.
     Portions copyright (C) 2012 Peter Cock, The James Hutton Institute.
 
@@ -24,13 +24,18 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
 FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.  */
 
+#include <config.h>
+
 #include <assert.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include "htslib/thread_pool.h"
+#include "sam_opts.h"
 #include "htslib/kstring.h"
 #include "htslib/sam.h"
+#include "samtools.h"
 
 /*
  * This function calculates ct tag for two bams, it assumes they are from the same template and
@@ -151,9 +156,30 @@ static bool plausibly_properly_paired(bam1_t* a, bam1_t* b)
         return false;
 }
 
-static void sync_mq(bam1_t* src, bam1_t* dest)
+// Returns 0 on success, -1 on failure.
+static int bam_format_cigar(const bam1_t* b, kstring_t* str)
+{
+    // An empty cigar is a special case return "*" rather than ""
+    if (b->core.n_cigar == 0) {
+        return (kputc('*', str) == EOF) ? -1 : 0;
+    }
+
+    const uint32_t *cigar = bam_get_cigar(b);
+    uint32_t i;
+
+    for (i = 0; i < b->core.n_cigar; ++i) {
+        if (kputw(bam_cigar_oplen(cigar[i]), str) == EOF) return -1;
+        if (kputc(bam_cigar_opchr(cigar[i]), str) == EOF) return -1;
+    }
+
+    return 0;
+}
+
+// Returns 0 on success, -1 on failure.
+static int sync_mq_mc(bam1_t* src, bam1_t* dest)
 {
     if ( (src->core.flag & BAM_FUNMAP) == 0 ) { // If mapped
+        // Copy Mate Mapping Quality
         uint32_t mq = src->core.qual;
         uint8_t* data;
         if ((data = bam_aux_get(dest,"MQ")) != NULL) {
@@ -162,29 +188,50 @@ static void sync_mq(bam1_t* src, bam1_t* dest)
 
         bam_aux_append(dest, "MQ", 'i', sizeof(uint32_t), (uint8_t*)&mq);
     }
+    // Copy mate cigar if either read is mapped
+    if ( (src->core.flag & BAM_FUNMAP) == 0 || (dest->core.flag & BAM_FUNMAP) == 0 ) {
+        uint8_t* data_mc;
+        if ((data_mc = bam_aux_get(dest,"MC")) != NULL) {
+            bam_aux_del(dest, data_mc);
+        }
+
+        // Convert cigar to string
+        kstring_t mc = { 0, 0, NULL };
+        if (bam_format_cigar(src, &mc) < 0) return -1;
+
+        bam_aux_append(dest, "MC", 'Z', ks_len(&mc)+1, (uint8_t*)ks_str(&mc));
+        free(mc.s);
+    }
+    return 0;
 }
 
-// copy flags
-static void sync_mate(bam1_t* a, bam1_t* b)
+// Copy flags.
+// Returns 0 on success, -1 on failure.
+static int sync_mate(bam1_t* a, bam1_t* b)
 {
     sync_unmapped_pos_inner(a,b);
     sync_unmapped_pos_inner(b,a);
     sync_mate_inner(a,b);
     sync_mate_inner(b,a);
-    sync_mq(a,b);
-    sync_mq(b,a);
+    if (sync_mq_mc(a,b) < 0) return -1;
+    if (sync_mq_mc(b,a) < 0) return -1;
+    return 0;
 }
 
 // currently, this function ONLY works if each read has one hit
-static void bam_mating_core(samFile* in, samFile* out, int remove_reads, int proper_pair_check, int add_ct)
+static int bam_mating_core(samFile* in, samFile* out, int remove_reads, int proper_pair_check, int add_ct)
 {
     bam_hdr_t *header;
-    bam1_t *b[2];
+    bam1_t *b[2] = { NULL, NULL };
     int curr, has_prev, pre_end = 0, cur_end = 0;
     kstring_t str;
 
     str.l = str.m = 0; str.s = 0;
     header = sam_hdr_read(in);
+    if (header == NULL) {
+        fprintf(stderr, "[bam_mating_core] ERROR: Couldn't read header\n");
+        return 1;
+    }
     // Accept unknown, unsorted, or queryname sort order, but error on coordinate sorted.
     if ((header->l_text > 3) && (strncmp(header->text, "@HD", 3) == 0)) {
         char *p, *q;
@@ -194,10 +241,10 @@ static void bam_mating_core(samFile* in, samFile* out, int remove_reads, int pro
         // (e.g. must ignore in a @CO comment line later in header)
         if ((p != 0) && (p < q)) {
             fprintf(stderr, "[bam_mating_core] ERROR: Coordinate sorted, require grouped/sorted by queryname.\n");
-            exit(1);
+            goto fail;
         }
     }
-    sam_hdr_write(out, header);
+    if (sam_hdr_write(out, header) < 0) goto write_fail;
 
     b[0] = bam_init1();
     b[1] = bam_init1();
@@ -206,12 +253,14 @@ static void bam_mating_core(samFile* in, samFile* out, int remove_reads, int pro
         bam1_t *cur = b[curr], *pre = b[1-curr];
         if (cur->core.flag & BAM_FSECONDARY)
         {
-            if ( !remove_reads ) sam_write1(out, header, cur);
+            if ( !remove_reads ) {
+                if (sam_write1(out, header, cur) < 0) goto write_fail;
+            }
             continue; // skip secondary alignments
         }
         if (cur->core.flag & BAM_FSUPPLEMENTARY)
         {
-            sam_write1(out, header, cur);
+            if (sam_write1(out, header, cur) < 0) goto write_fail;
             continue; // pass supplementary alignments through unchanged (TODO:make them match read they came from)
         }
         if (cur->core.tid < 0 || cur->core.pos < 0) // If unmapped set the flag
@@ -229,7 +278,7 @@ static void bam_mating_core(samFile* in, samFile* out, int remove_reads, int pro
             if (strcmp(bam_get_qname(cur), bam_get_qname(pre)) == 0) { // identical pair name
                 pre->core.flag |= BAM_FPAIRED;
                 cur->core.flag |= BAM_FPAIRED;
-                sync_mate(pre, cur);
+                if (sync_mate(pre, cur)) goto fail;
 
                 if (pre->core.tid == cur->core.tid && !(cur->core.flag&(BAM_FUNMAP|BAM_FMUNMAP))
                     && !(pre->core.flag&(BAM_FUNMAP|BAM_FMUNMAP))) // if safe set TLEN/ISIZE
@@ -248,14 +297,18 @@ static void bam_mating_core(samFile* in, samFile* out, int remove_reads, int pro
 
                 // Write out result
                 if ( !remove_reads ) {
-                    sam_write1(out, header, pre);
-                    sam_write1(out, header, cur);
+                    if (sam_write1(out, header, pre) < 0) goto write_fail;
+                    if (sam_write1(out, header, cur) < 0) goto write_fail;
                 } else {
                     // If we have to remove reads make sure we do it in a way that doesn't create orphans with bad flags
                     if(pre->core.flag&BAM_FUNMAP) cur->core.flag &= ~(BAM_FPAIRED|BAM_FMREVERSE|BAM_FPROPER_PAIR);
                     if(cur->core.flag&BAM_FUNMAP) pre->core.flag &= ~(BAM_FPAIRED|BAM_FMREVERSE|BAM_FPROPER_PAIR);
-                    if(!(pre->core.flag&BAM_FUNMAP)) sam_write1(out, header, pre);
-                    if(!(cur->core.flag&BAM_FUNMAP)) sam_write1(out, header, cur);
+                    if(!(pre->core.flag&BAM_FUNMAP)) {
+                        if (sam_write1(out, header, pre) < 0) goto write_fail;
+                    }
+                    if(!(cur->core.flag&BAM_FUNMAP)) {
+                        if (sam_write1(out, header, cur) < 0) goto write_fail;
+                    }
                 }
                 has_prev = 0;
             } else { // unpaired?  clear bad info and write it out
@@ -266,7 +319,9 @@ static void bam_mating_core(samFile* in, samFile* out, int remove_reads, int pro
                 }
                 pre->core.mtid = -1; pre->core.mpos = -1; pre->core.isize = 0;
                 pre->core.flag &= ~(BAM_FPAIRED|BAM_FMREVERSE|BAM_FPROPER_PAIR|BAM_FREAD1|BAM_FREAD2|BAM_FMUNMAP);
-                if ( !remove_reads || !(pre->core.flag&BAM_FUNMAP) ) sam_write1(out, header, pre);
+                if ( !remove_reads || !(pre->core.flag&BAM_FUNMAP) ) {
+                    if (sam_write1(out, header, pre) < 0) goto write_fail;
+                }
             }
         } else has_prev = 1;
         curr = 1 - curr;
@@ -282,72 +337,105 @@ static void bam_mating_core(samFile* in, samFile* out, int remove_reads, int pro
         pre->core.mtid = -1; pre->core.mpos = -1; pre->core.isize = 0;
         pre->core.flag &= ~(BAM_FPAIRED|BAM_FMREVERSE|BAM_FPROPER_PAIR|BAM_FREAD1|BAM_FREAD2|BAM_FMUNMAP);
 
-        sam_write1(out, header, pre);
+        if (sam_write1(out, header, pre) < 0) goto write_fail;
     }
     bam_hdr_destroy(header);
     bam_destroy1(b[0]);
     bam_destroy1(b[1]);
     free(str.s);
+    return 0;
+
+ write_fail:
+    print_error_errno("fixmate", "Couldn't write to output file");
+ fail:
+    bam_hdr_destroy(header);
+    bam_destroy1(b[0]);
+    bam_destroy1(b[1]);
+    return 1;
 }
 
 void usage(FILE* where)
 {
-    fprintf(where,"Usage: samtools fixmate <in.nameSrt.bam> <out.nameSrt.bam>\n\n");
-    fprintf(where,"Options:\n");
-    fprintf(stderr,"  -r         Remove unmapped reads and secondary alignments\n");
-    fprintf(stderr,"  -p         Disable FR proper pair check\n");
-    fprintf(stderr,"  -c         Add template cigar ct tag\n");
-    fprintf(stderr,"  -O FORMAT  Write output as FORMAT ('sam'/'bam'/'cram')\n");
-    fprintf(stderr,"As elsewhere in samtools, use '-' as the filename for stdin/stdout. The input\n");
-    fprintf(stderr,"file must be grouped by read name (e.g. sorted by name). Coordinated sorted\n");
-    fprintf(stderr,"input is not accepted.\n");
+    fprintf(where,
+"Usage: samtools fixmate <in.nameSrt.bam> <out.nameSrt.bam>\n"
+"Options:\n"
+"  -r           Remove unmapped reads and secondary alignments\n"
+"  -p           Disable FR proper pair check\n"
+"  -c           Add template cigar ct tag\n");
+
+    sam_global_opt_help(where, "-.O..@");
+
+    fprintf(where,
+"\n"
+"As elsewhere in samtools, use '-' as the filename for stdin/stdout. The input\n"
+"file must be grouped by read name (e.g. sorted by name). Coordinated sorted\n"
+"input is not accepted.\n");
 }
 
 int bam_mating(int argc, char *argv[])
 {
-    samFile *in, *out;
-    int c, remove_reads = 0, proper_pair_check = 1, add_ct = 0;
-    char* fmtout = NULL;
-    char modeout[12];
+    htsThreadPool p = {NULL, 0};
+    samFile *in = NULL, *out = NULL;
+    int c, remove_reads = 0, proper_pair_check = 1, add_ct = 0, res = 1;
+    sam_global_args ga = SAM_GLOBAL_ARGS_INIT;
+    char wmode[3] = {'w', 'b', 0};
+    static const struct option lopts[] = {
+        SAM_OPT_GLOBAL_OPTIONS('-', 0, 'O', 0, 0, '@'),
+        { NULL, 0, NULL, 0 }
+    };
+
     // parse args
     if (argc == 1) { usage(stdout); return 0; }
-    while ((c = getopt(argc, argv, "rpcO:")) >= 0) {
+    while ((c = getopt_long(argc, argv, "rpcO:@:", lopts, NULL)) >= 0) {
         switch (c) {
             case 'r': remove_reads = 1; break;
             case 'p': proper_pair_check = 0; break;
             case 'c': add_ct = 1; break;
-            case 'O': fmtout = optarg; break;
-            default: usage(stderr); return 1;
+            default:  if (parse_sam_global_opt(c, optarg, lopts, &ga) == 0) break;
+                      /* else fall-through */
+            case '?': usage(stderr); goto fail;
         }
     }
-    if (optind+1 >= argc) { usage(stderr); return 1; }
-    strcpy(modeout, "w");
-    if (sam_open_mode(&modeout[1], argv[optind+1], fmtout) < 0) {
-        if (fmtout) {
-            fprintf(stderr, "[bam_mating] cannot parse output format \"%s\"\n", fmtout);
-            return 1;
-        }
-
-        // Couldn't determine format from the filename; an unrecognised
-        // extension or perhaps "-".  Emit BAM as samtools 0.1.x did.
-        strcat(modeout, "b");
-    }
+    if (optind+1 >= argc) { usage(stderr); goto fail; }
 
     // init
-    if ((in = sam_open(argv[optind], "r")) == NULL) {
-        fprintf(stderr, "[bam_mating] cannot open input file\n");
-        return 1;
+    if ((in = sam_open_format(argv[optind], "rb", &ga.in)) == NULL) {
+        print_error_errno("fixmate", "cannot open input file");
+        goto fail;
     }
-    if ((out = sam_open(argv[optind+1], modeout)) == NULL) {
-        fprintf(stderr, "[bam_mating] cannot open output file\n");
-        return 1;
+    sam_open_mode(wmode+1, argv[optind+1], NULL);
+    if ((out = sam_open_format(argv[optind+1], wmode, &ga.out)) == NULL) {
+        print_error_errno("fixmate", "cannot open output file");
+        goto fail;
+    }
+
+    if (ga.nthreads > 0) {
+        if (!(p.pool = hts_tpool_init(ga.nthreads))) {
+            fprintf(stderr, "Error creating thread pool\n");
+            goto fail;
+        }
+        hts_set_opt(in,  HTS_OPT_THREAD_POOL, &p);
+        hts_set_opt(out, HTS_OPT_THREAD_POOL, &p);
     }
 
     // run
-    bam_mating_core(in, out, remove_reads, proper_pair_check, add_ct);
+    res = bam_mating_core(in, out, remove_reads, proper_pair_check, add_ct);
+
     // cleanup
-    sam_close(in); sam_close(out);
-    return 0;
+    sam_close(in);
+    if (sam_close(out) < 0) {
+        fprintf(stderr, "[bam_mating] error while closing output file\n");
+        res = 1;
+    }
+
+    if (p.pool) hts_tpool_destroy(p.pool);
+    sam_global_args_free(&ga);
+    return res;
+
+ fail:
+    if (in) sam_close(in);
+    if (out) sam_close(out);
+    if (p.pool) hts_tpool_destroy(p.pool);
+    sam_global_args_free(&ga);
+    return 1;
 }
-
-

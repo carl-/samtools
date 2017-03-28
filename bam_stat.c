@@ -22,14 +22,19 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
 FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.  */
 
+#include <config.h>
+
 #include <unistd.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <limits.h>
+#include <getopt.h>
 
 #include "htslib/sam.h"
 #include "samtools.h"
+#include "sam_opts.h"
 
 typedef struct {
     long long n_reads[2], n_mapped[2], n_pair_all[2], n_pair_map[2], n_pair_good[2];
@@ -88,22 +93,51 @@ static const char *percent(char *buffer, long long n, long long total)
     return buffer;
 }
 
+static void usage_exit(FILE *fp, int exit_status)
+{
+    fprintf(fp, "Usage: samtools flagstat [options] <in.bam>\n");
+    sam_global_opt_help(fp, "-.---@");
+    exit(exit_status);
+}
+
 int bam_flagstat(int argc, char *argv[])
 {
     samFile *fp;
     bam_hdr_t *header;
     bam_flagstat_t *s;
     char b0[16], b1[16];
+    int c;
 
-    if (argc == optind) {
-        fprintf(stderr, "Usage: samtools flagstat <in.bam>\n");
-        return 1;
+    enum {
+        INPUT_FMT_OPTION = CHAR_MAX+1,
+    };
+
+    sam_global_args ga = SAM_GLOBAL_ARGS_INIT;
+    static const struct option lopts[] = {
+        SAM_OPT_GLOBAL_OPTIONS('-', 0, '-', '-', '-', '@'),
+        {NULL, 0, NULL, 0}
+    };
+
+    while ((c = getopt_long(argc, argv, "@:", lopts, NULL)) >= 0) {
+        switch (c) {
+        default:  if (parse_sam_global_opt(c, optarg, lopts, &ga) == 0) break;
+            /* else fall-through */
+        case '?':
+            usage_exit(stderr, EXIT_FAILURE);
+        }
     }
-    fp = sam_open(argv[optind], "r");
+
+    if (argc != optind+1) {
+        if (argc == optind) usage_exit(stdout, EXIT_SUCCESS);
+        else usage_exit(stderr, EXIT_FAILURE);
+    }
+    fp = sam_open_format(argv[optind], "r", &ga.in);
     if (fp == NULL) {
-        print_error_errno("Cannot open input file \"%s\"", argv[optind]);
+        print_error_errno("flagstat", "Cannot open input file \"%s\"", argv[optind]);
         return 1;
     }
+    if (ga.nthreads > 0)
+        hts_set_threads(fp, ga.nthreads);
 
     if (hts_set_opt(fp, CRAM_OPT_REQUIRED_FIELDS,
                     SAM_FLAG | SAM_MAPQ | SAM_RNEXT)) {
@@ -117,6 +151,10 @@ int bam_flagstat(int argc, char *argv[])
     }
 
     header = sam_hdr_read(fp);
+    if (header == NULL) {
+        fprintf(stderr, "Failed to read header for \"%s\"\n", argv[optind]);
+        return 1;
+    }
     s = bam_flagstat_core(fp, header);
     printf("%lld + %lld in total (QC-passed reads + QC-failed reads)\n", s->n_reads[0], s->n_reads[1]);
     printf("%lld + %lld secondary\n", s->n_secondary[0], s->n_secondary[1]);
@@ -134,5 +172,6 @@ int bam_flagstat(int argc, char *argv[])
     free(s);
     bam_hdr_destroy(header);
     sam_close(fp);
+    sam_global_args_free(&ga);
     return 0;
 }
