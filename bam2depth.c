@@ -30,12 +30,16 @@ DEALINGS IN THE SOFTWARE.  */
  *   gcc -g -O2 -Wall -o bam2depth -D_MAIN_BAM2DEPTH bam2depth.c -lhts -lz
  */
 
+#include <config.h>
+
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <limits.h>
 #include <unistd.h>
 #include "htslib/sam.h"
 #include "samtools.h"
+#include "sam_opts.h"
 
 typedef struct {     // auxiliary data structure
     samFile *fp;     // the file handle
@@ -68,9 +72,34 @@ static int read_bam(void *data, bam1_t *b) // read level filters better go here 
 
 int read_file_list(const char *file_list,int *n,char **argv[]);
 
+static int usage() {
+    fprintf(stderr, "\n");
+    fprintf(stderr, "Usage: samtools depth [options] in1.bam [in2.bam [...]]\n");
+    fprintf(stderr, "Options:\n");
+    fprintf(stderr, "   -a                  output all positions (including zero depth)\n");
+    fprintf(stderr, "   -a -a (or -aa)      output absolutely all positions, including unused ref. sequences\n");
+    fprintf(stderr, "   -b <bed>            list of positions or regions\n");
+    fprintf(stderr, "   -f <list>           list of input BAM filenames, one per line [null]\n");
+    fprintf(stderr, "   -l <int>            read length threshold (ignore reads shorter than <int>) [0]\n");
+    fprintf(stderr, "   -d/-m <int>         maximum coverage depth [8000]\n");  // the htslib's default
+    fprintf(stderr, "   -q <int>            base quality threshold [0]\n");
+    fprintf(stderr, "   -Q <int>            mapping quality threshold [0]\n");
+    fprintf(stderr, "   -r <chr:from-to>    region\n");
+
+    sam_global_opt_help(stderr, "-.--.-");
+
+    fprintf(stderr, "\n");
+    fprintf(stderr, "The output is a simple tab-separated table with three columns: reference name,\n");
+    fprintf(stderr, "position, and coverage depth.  Note that positions with zero coverage may be\n");
+    fprintf(stderr, "omitted by default; see the -a option.\n");
+    fprintf(stderr, "\n");
+
+    return 1;
+}
+
 int main_depth(int argc, char *argv[])
 {
-    int i, n, tid, beg, end, pos, *n_plp, baseQ = 0, mapQ = 0, min_len = 0;
+    int i, n, tid, reg_tid, beg, end, pos, *n_plp, baseQ = 0, mapQ = 0, min_len = 0;
     int all = 0, status = EXIT_SUCCESS, nfiles, max_depth = -1;
     const bam_pileup1_t **plp;
     char *reg = 0; // specified region
@@ -79,40 +108,35 @@ int main_depth(int argc, char *argv[])
     bam_hdr_t *h = NULL; // BAM header of the 1st input
     aux_t **data;
     bam_mplp_t mplp;
-    int last_pos = -1, last_tid = -1;
+    int last_pos = -1, last_tid = -1, ret;
+
+    sam_global_args ga = SAM_GLOBAL_ARGS_INIT;
+    static const struct option lopts[] = {
+        SAM_OPT_GLOBAL_OPTIONS('-', 0, '-', '-', 0, '-'),
+        { NULL, 0, NULL, 0 }
+    };
 
     // parse the command line
-    while ((n = getopt(argc, argv, "r:b:q:Q:l:f:am:")) >= 0) {
+    while ((n = getopt_long(argc, argv, "r:b:q:Q:l:f:am:d:", lopts, NULL)) >= 0) {
         switch (n) {
             case 'l': min_len = atoi(optarg); break; // minimum query length
             case 'r': reg = strdup(optarg); break;   // parsing a region requires a BAM header
             case 'b':
                 bed = bed_read(optarg); // BED or position list file can be parsed now
-                if (!bed) { print_error_errno("Could not read file \"%s\"", optarg); return 1; }
+                if (!bed) { print_error_errno("depth", "Could not read file \"%s\"", optarg); return 1; }
                 break;
             case 'q': baseQ = atoi(optarg); break;   // base quality threshold
             case 'Q': mapQ = atoi(optarg); break;    // mapping quality threshold
             case 'f': file_list = optarg; break;
             case 'a': all++; break;
-            case 'm': max_depth = atoi(optarg); break; // maximum coverage depth
+            case 'd': case 'm': max_depth = atoi(optarg); break; // maximum coverage depth
+            default:  if (parse_sam_global_opt(n, optarg, lopts, &ga) == 0) break;
+                      /* else fall-through */
+            case '?': return usage();
         }
     }
-    if (optind == argc && !file_list) {
-        fprintf(stderr, "\n");
-        fprintf(stderr, "Usage: samtools depth [options] in1.bam [in2.bam [...]]\n");
-        fprintf(stderr, "Options:\n");
-        fprintf(stderr, "   -a                  output all positions (including zero depth)\n");
-        fprintf(stderr, "   -a -a (or -aa)      output absolutely all positions, including unused ref. sequences\n");
-        fprintf(stderr, "   -b <bed>            list of positions or regions\n");
-        fprintf(stderr, "   -f <list>           list of input BAM filenames, one per line [null]\n");
-        fprintf(stderr, "   -l <int>            read length threshold (ignore reads shorter than <int>)\n");
-        fprintf(stderr, "   -m <int>            maximum coverage depth [8000]\n");  // the htslib's default
-        fprintf(stderr, "   -q <int>            base quality threshold\n");
-        fprintf(stderr, "   -Q <int>            mapping quality threshold\n");
-        fprintf(stderr, "   -r <chr:from-to>    region\n");
-        fprintf(stderr, "\n");
-        return 1;
-    }
+    if (optind == argc && !file_list)
+        return usage();
 
     // initialize the auxiliary data structures
     if (file_list)
@@ -125,18 +149,19 @@ int main_depth(int argc, char *argv[])
     else
         n = argc - optind; // the number of BAMs on the command line
     data = calloc(n, sizeof(aux_t*)); // data[i] for the i-th input
-    beg = 0; end = 1<<30;  // set the default region
+    reg_tid = 0; beg = 0; end = INT_MAX;  // set the default region
     for (i = 0; i < n; ++i) {
+        int rf;
         data[i] = calloc(1, sizeof(aux_t));
-        data[i]->fp = sam_open(argv[optind+i], "r"); // open BAM
+        data[i]->fp = sam_open_format(argv[optind+i], "r", &ga.in); // open BAM
         if (data[i]->fp == NULL) {
-            print_error_errno("Could not open \"%s\"", argv[optind+i]);
+            print_error_errno("depth", "Could not open \"%s\"", argv[optind+i]);
             status = EXIT_FAILURE;
             goto depth_end;
         }
-        if (hts_set_opt(data[i]->fp, CRAM_OPT_REQUIRED_FIELDS,
-                        SAM_FLAG | SAM_RNAME | SAM_POS | SAM_MAPQ | SAM_CIGAR |
-                        SAM_SEQ)) {
+        rf = SAM_FLAG | SAM_RNAME | SAM_POS | SAM_MAPQ | SAM_CIGAR | SAM_SEQ;
+        if (baseQ) rf |= SAM_QUAL;
+        if (hts_set_opt(data[i]->fp, CRAM_OPT_REQUIRED_FIELDS, rf)) {
             fprintf(stderr, "Failed to set CRAM_OPT_REQUIRED_FIELDS value\n");
             return 1;
         }
@@ -147,17 +172,23 @@ int main_depth(int argc, char *argv[])
         data[i]->min_mapQ = mapQ;                    // set the mapQ filter
         data[i]->min_len  = min_len;                 // set the qlen filter
         data[i]->hdr = sam_hdr_read(data[i]->fp);    // read the BAM header
+        if (data[i]->hdr == NULL) {
+            fprintf(stderr, "Couldn't read header for \"%s\"\n",
+                    argv[optind+i]);
+            status = EXIT_FAILURE;
+            goto depth_end;
+        }
         if (reg) { // if a region is specified
             hts_idx_t *idx = sam_index_load(data[i]->fp, argv[optind+i]);  // load the index
             if (idx == NULL) {
-                print_error("can't load index for \"%s\"", argv[optind+i]);
+                print_error("depth", "can't load index for \"%s\"", argv[optind+i]);
                 status = EXIT_FAILURE;
                 goto depth_end;
             }
             data[i]->iter = sam_itr_querys(idx, data[i]->hdr, reg); // set the iterator
             hts_idx_destroy(idx); // the index is not needed any more; free the memory
             if (data[i]->iter == NULL) {
-                print_error("can't parse region \"%s\"", reg);
+                print_error("depth", "can't parse region \"%s\"", reg);
                 status = EXIT_FAILURE;
                 goto depth_end;
             }
@@ -168,6 +199,7 @@ int main_depth(int argc, char *argv[])
     if (reg) {
         beg = data[0]->iter->beg; // and to the parsed region coordinates
         end = data[0]->iter->end;
+        reg_tid = data[0]->iter->tid;
     }
 
     // the core multi-pileup loop
@@ -176,15 +208,15 @@ int main_depth(int argc, char *argv[])
         bam_mplp_set_maxcnt(mplp,max_depth);  // set maximum coverage depth
     n_plp = calloc(n, sizeof(int)); // n_plp[i] is the number of covering reads from the i-th BAM
     plp = calloc(n, sizeof(bam_pileup1_t*)); // plp[i] points to the array of covering reads (internal in mplp)
-    while (bam_mplp_auto(mplp, &tid, &pos, n_plp, plp) > 0) { // come to the next covered position
+    while ((ret=bam_mplp_auto(mplp, &tid, &pos, n_plp, plp)) > 0) { // come to the next covered position
         if (pos < beg || pos >= end) continue; // out of range; skip
         if (tid >= h->n_targets) continue;     // diff number of @SQ lines per file?
-        if (bed && bed_overlap(bed, h->target_name[tid], pos, pos + 1) == 0) continue; // not in BED; skip
         if (all) {
             while (tid > last_tid) {
-                if (last_tid >= 0 && all > 1 && !reg) {
-                    // Deal with remainder or entirety of last tid
+                if (last_tid >= 0 && !reg) {
+                    // Deal with remainder or entirety of last tid.
                     while (++last_pos < h->target_len[last_tid]) {
+                        // Horribly inefficient, but the bed API is an obfuscated black box.
                         if (bed && bed_overlap(bed, h->target_name[last_tid], last_pos, last_pos + 1) == 0)
                             continue;
                         fputs(h->target_name[last_tid], stdout); printf("\t%d", last_pos+1);
@@ -195,6 +227,8 @@ int main_depth(int argc, char *argv[])
                 }
                 last_tid++;
                 last_pos = -1;
+                if (all < 2)
+                    break;
             }
 
             // Deal with missing portion of current tid
@@ -211,6 +245,7 @@ int main_depth(int argc, char *argv[])
             last_tid = tid;
             last_pos = pos;
         }
+        if (bed && bed_overlap(bed, h->target_name[tid], pos, pos + 1) == 0) continue;
         fputs(h->target_name[tid], stdout); printf("\t%d", pos+1); // a customized printf() would be faster
         for (i = 0; i < n; ++i) { // base level filters have to go here
             int j, m = 0;
@@ -223,12 +258,17 @@ int main_depth(int argc, char *argv[])
         }
         putchar('\n');
     }
+    if (ret < 0) status = EXIT_FAILURE;
     free(n_plp); free(plp);
     bam_mplp_destroy(mplp);
 
     if (all) {
         // Handle terminating region
-        while (last_tid < h->n_targets) {
+        if (last_tid < 0 && reg && all > 1) {
+            last_tid = reg_tid;
+            last_pos = beg-1;
+        }
+        while (last_tid >= 0 && last_tid < h->n_targets) {
             while (++last_pos < h->target_len[last_tid]) {
                 if (last_pos >= end) break;
                 if (bed && bed_overlap(bed, h->target_name[last_tid], last_pos, last_pos + 1) == 0)
@@ -243,7 +283,7 @@ int main_depth(int argc, char *argv[])
             if (all < 2 || reg)
                 break;
         }
-    } 
+    }
 
 depth_end:
     for (i = 0; i < n && data[i]; ++i) {
@@ -259,6 +299,7 @@ depth_end:
         for (i=0; i<n; i++) free(fn[i]);
         free(fn);
     }
+    sam_global_args_free(&ga);
     return status;
 }
 

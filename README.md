@@ -11,3 +11,22 @@ but tightly coordinated projects:
 
 See also http://github.com/samtools/
 
+### Building Samtools
+
+See [INSTALL](INSTALL) for complete details.
+[Release tarballs][download] contain generated files that have not been
+committed to this repository, so building the code from a Git repository
+requires an extra step:
+
+```sh
+autoconf -Wno-syntax  # Generate the configure script, if needed
+./configure           # Optional, needed for choosing optional functionality
+make
+make install
+```
+
+By default, this will build against an HTSlib source tree in `../htslib`.
+You can alter this to a source tree elsewhere or to a previously-installed
+HTSlib by configuring with `--with-htslib=DIR`.
+
+[download]: http://www.htslib.org/download/

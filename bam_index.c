@@ -24,6 +24,8 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
 FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.  */
 
+#include <config.h>
+
 #include <htslib/hts.h>
 #include <htslib/sam.h>
 #include <htslib/khash.h>
@@ -33,13 +35,9 @@ DEALINGS IN THE SOFTWARE.  */
 #include <inttypes.h>
 #include <unistd.h>
 
-#define BAM_LIDX_SHIFT    14
+#include "samtools.h"
 
-int bam_index_build2(const char *fn, const char *_fnidx)
-{
-    fprintf(stderr, "Samtools-htslib-API: bam_index_build2() not yet implemented\n");
-    abort();
-}
+#define BAM_LIDX_SHIFT    14
 
 static void index_usage(FILE *fp)
 {
@@ -48,20 +46,23 @@ static void index_usage(FILE *fp)
 "Options:\n"
 "  -b       Generate BAI-format index for BAM files [default]\n"
 "  -c       Generate CSI-format index for BAM files\n"
-"  -m INT   Set minimum interval size for CSI indices to 2^INT [%d]\n", BAM_LIDX_SHIFT);
+"  -m INT   Set minimum interval size for CSI indices to 2^INT [%d]\n"
+"  -@ INT   Sets the number of threads [none]\n", BAM_LIDX_SHIFT);
 }
 
 int bam_index(int argc, char *argv[])
 {
     int csi = 0;
     int min_shift = BAM_LIDX_SHIFT;
-    int c;
+    int n_threads = 0;
+    int c, ret;
 
-    while ((c = getopt(argc, argv, "bcm:")) >= 0)
+    while ((c = getopt(argc, argv, "bcm:@:")) >= 0)
         switch (c) {
         case 'b': csi = 0; break;
         case 'c': csi = 1; break;
         case 'm': csi = 1; min_shift = atoi(optarg); break;
+        case '@': n_threads = atoi(optarg); break;
         default:
             index_usage(stderr);
             return 1;
@@ -71,9 +72,33 @@ int bam_index(int argc, char *argv[])
         index_usage(stdout);
         return 1;
     }
-    if (argc - optind > 1) bam_index_build2(argv[optind], argv[optind+1]);
-    else bam_index_build(argv[optind], csi? min_shift : 0);
-    return 0;
+
+    ret = sam_index_build3(argv[optind], argv[optind+1], csi? min_shift : 0, n_threads);
+    switch (ret) {
+    case 0:
+        return 0;
+
+    case -2:
+        print_error_errno("index", "failed to open \"%s\"", argv[optind]);
+        break;
+
+    case -3:
+        print_error("index", "\"%s\" is in a format that cannot be usefully indexed", argv[optind]);
+        break;
+
+    case -4:
+        if (argv[optind+1])
+            print_error("index", "failed to create or write index \"%s\"", argv[optind+1]);
+        else
+            print_error("index", "failed to create or write index");
+        break;
+
+    default:
+        print_error_errno("index", "failed to create index for \"%s\"", argv[optind]);
+        break;
+    }
+
+    return EXIT_FAILURE;
 }
 
 int bam_idxstats(int argc, char *argv[])
@@ -87,10 +112,20 @@ int bam_idxstats(int argc, char *argv[])
         return 1;
     }
     fp = sam_open(argv[1], "r");
-    if (fp == NULL) { fprintf(stderr, "[%s] fail to open BAM.\n", __func__); return 1; }
+    if (fp == NULL) {
+        print_error_errno("idxstats", "failed to open \"%s\"", argv[1]);
+        return 1;
+    }
     header = sam_hdr_read(fp);
+    if (header == NULL) {
+        print_error("idxstats", "failed to read header for \"%s\"", argv[1]);
+        return 1;
+    }
     idx = sam_index_load(fp, argv[1]);
-    if (idx == NULL) { fprintf(stderr, "[%s] fail to load the index.\n", __func__); return 1; }
+    if (idx == NULL) {
+        print_error("idxstats", "fail to load index for \"%s\"", argv[1]);
+        return 1;
+    }
 
     int i;
     for (i = 0; i < header->n_targets; ++i) {
